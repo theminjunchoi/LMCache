@@ -6,18 +6,32 @@ server handler, and client-side adapter API.
 
 # Standard
 from unittest.mock import MagicMock, patch
+import json
 
 # Third Party
 import pytest
+import torch
 
 # First Party
 from lmcache.lmcache_native import Bitmap
-from lmcache.v1.distributed.api import AttnWindowDesc, PrefetchHandle, PrefetchResult
+from lmcache.v1.distributed.api import (
+    AttnWindowDesc,
+    GroupedObjectKeys,
+    MemoryLayoutDesc,
+    PrefetchHandle,
+    PrefetchResult,
+    PrefetchTaskSpec,
+    ipc_key_to_object_keys,
+)
+from lmcache.v1.distributed.config import parse_args
+from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.mp_observability.event import EventType
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.modules.lookup import LookupModule, _PrefetchJob
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.multiprocess.rpc import get_rpc_spec
+from lmcache.v1.multiprocess.session import Session
+from lmcache.v1.multiprocess.token_hasher import TokenHasher
 from lmcache.v1.multiprocess.transport.factory import RequestClientFactory
 
 # Test helpers
@@ -535,3 +549,89 @@ def test_disjoint_frees_for_one_lookup_both_land():
     module.free_lookup_locks(_free_locks_key(1024, start=0, end=512), 1)
 
     assert ctx.storage_manager.finish_read_prefetched.call_count == 2
+
+
+@pytest.mark.parametrize("num_l1", [1, 2])
+def test_free_releases_an_abandoned_lookup_range_on_multi_l1(num_l1: int) -> None:
+    """A re-lookup must not lose the L1 owners of the lookup it replaced.
+
+    The abandoned lookup's locks are freed later through ``extra_ranges``;
+    on multi-L1 each release needs the owner its lock was taken on.
+    """
+    chunk = 256
+    layout = MemoryLayoutDesc([torch.Size([4096])], [torch.uint8])
+    args = ["--eviction-policy", "noop"]
+    for tag in ["_default", "b"][:num_l1]:
+        args += [
+            "--l1-manager",
+            json.dumps(
+                {"type": "DRAM", "tag": tag, "size_gb": 1 / 1024, "use_lazy": False}
+            ),
+        ]
+    storage = StorageManager(parse_args(args))
+
+    def key(start: int, end: int) -> IPCCacheServerKey:
+        return IPCCacheServerKey(
+            model_name="m",
+            world_size=1,
+            num_kv_readers=1,
+            worker_id=None,
+            token_ids=tuple(range(4 * chunk)),
+            start=start,
+            end=end,
+            request_id="r",
+        )
+
+    try:
+        hasher = TokenHasher(chunk_size=chunk)
+        session = Session(request_id="r", hasher=hasher)
+        ctx = MagicMock()
+        ctx.chunk_size = chunk
+        ctx.token_hasher = hasher
+        ctx.storage_manager = storage
+        ctx.layout_desc_registry.find_attn_desc.return_value = AttnWindowDesc(
+            num_chunks_in_sw=[-1]
+        )
+        ctx.session_manager.get_or_create.return_value = session
+        ctx.get_read_owners.side_effect = lambda _: (
+            session.get_prefetch_owners() if storage.is_multi_l1 else None
+        )
+        module = LookupModule(ctx)
+
+        # The first lookup covers [256, 768) and read-locks both chunks.
+        first = key(chunk, 3 * chunk)
+        hashes = hasher.compute_chunk_hashes(
+            list(first.token_ids), start=chunk, end=3 * chunk
+        )
+        obj_keys = ipc_key_to_object_keys(first, hashes, [0])[0]
+        storage.finish_write_by_owner(
+            storage.prepare_write_completion(storage.reserve_write(obj_keys, layout))
+        )
+        session.begin_lookup(first, (-1,))
+        handle = storage.submit_prefetch_task(
+            PrefetchTaskSpec(
+                key_groups=[
+                    GroupedObjectKeys(
+                        keys=obj_keys, object_group_id=0, layout_desc=layout
+                    )
+                ]
+            )
+        )
+        assert storage.wait_prefetch_status(handle, 5)
+        result = storage.query_prefetch_status(handle)
+        session.record_prefetch_result(3, (0,), result.l1_owners)
+
+        # APC shrank, so a re-lookup from 0 replaces it and hits nothing.
+        session.begin_lookup(key(0, 4 * chunk), (-1,))
+        session.record_prefetch_result(0, (0,), {})
+
+        module.free_lookup_locks(key(0, 0), 1, extra_ranges=((chunk, 3 * chunk),))
+
+        assert not any(
+            state.read_lock.is_locked()
+            for manager in storage._l1_managers_by_id.values()
+            for obj_key in obj_keys
+            if (state := manager.get_object_state(obj_key)) is not None
+        )
+    finally:
+        storage.close()

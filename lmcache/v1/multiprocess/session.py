@@ -47,6 +47,10 @@ class Session:
     prefetch_locked_gids: tuple = ()
     prefetch_group_windows: tuple[int, ...] = ()
     _prefetch_owners: dict[ObjectKey, int] = field(default_factory=dict, repr=False)
+    # L1 owners of earlier lookups this request abandoned (APC shrink re-lookup).
+    # Their locks are released later through FREE's extra_ranges, which on
+    # multi-L1 needs the owner each lock was taken on.
+    _abandoned_owners: dict[ObjectKey, int] = field(default_factory=dict, repr=False)
     extras: dict[str, Any] = field(default_factory=dict)
     _lookup_generation: int = field(default=0, repr=False)
     _failed_retrieve_releases: set[tuple[int, int, int, int, int]] = field(
@@ -156,6 +160,7 @@ class Session:
             self.prefetch_group_windows = group_windows
             self._lookup_generation += 1
             self._failed_retrieve_releases.clear()
+            self._abandoned_owners.update(self._prefetch_owners)
             self._prefetch_owners.clear()
 
     def record_prefetch_result(
@@ -174,6 +179,22 @@ class Session:
         """Snapshot the L1 owners whose read locks this session's lookup retained."""
         with self._lock:
             return self._prefetch_owners.copy()
+
+    def pop_abandoned_owners(self, keys: list[ObjectKey]) -> dict[ObjectKey, int]:
+        """Take the L1 owners an abandoned lookup retained for ``keys``.
+
+        Args:
+            keys: Keys of an abandoned lookup's range that are being released.
+
+        Returns:
+            The owner of each key that has one; released keys are forgotten.
+        """
+        with self._lock:
+            return {
+                key: self._abandoned_owners.pop(key)
+                for key in keys
+                if key in self._abandoned_owners
+            }
 
     def prepare_failed_retrieve_release(
         self,

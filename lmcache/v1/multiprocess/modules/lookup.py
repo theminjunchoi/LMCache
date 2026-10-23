@@ -523,6 +523,7 @@ class LookupModule(DiscoverableModule):
         # would drop another request's lock on the shared object key.
         lookup_key = session.lookup_ipc_key
         lock_floor = lookup_key.start if lookup_key is not None else 0
+        read_locks = key.require_num_kv_readers()
         obj_keys: list[ObjectKey] = []
         if key.start < key.end:
             # The lookup never locked below its own ``start``.
@@ -534,13 +535,14 @@ class LookupModule(DiscoverableModule):
                     session.prefetch_locked_gids,
                 )
             )
+        extra_keys: list[ObjectKey] = []
         for range_start, range_end in extra_ranges:
             if range_start >= range_end:
                 continue
             # An abandoned lookup's range ends at its hit boundary, so the
             # range is its own lock model: resolve with that hit, not the
             # current lookup's.
-            obj_keys.extend(
+            extra_keys.extend(
                 resolve_prefetched_obj_keys(
                     self._ctx,
                     replace(key, start=range_start, end=range_end),
@@ -548,14 +550,23 @@ class LookupModule(DiscoverableModule):
                     session.prefetch_locked_gids,
                 )
             )
-        if not obj_keys:
-            return
 
-        self._ctx.storage_manager.finish_read_prefetched(
-            obj_keys,
-            read_locks=key.require_num_kv_readers(),
-            l1_owners=self._ctx.get_read_owners(key.request_id),
-        )
+        owners = self._ctx.get_read_owners(key.request_id)
+        if obj_keys:
+            self._ctx.storage_manager.finish_read_prefetched(
+                obj_keys, read_locks=read_locks, l1_owners=owners
+            )
+        if extra_keys:
+            # A range left by an abandoned lookup is locked on the owners that
+            # lookup recorded; any other extra range (a full hit giving back
+            # its last chunk) belongs to the current lookup.
+            extra_owners = None
+            if owners is not None:
+                extra_owners = {k: owners[k] for k in extra_keys if k in owners}
+                extra_owners.update(session.pop_abandoned_owners(extra_keys))
+            self._ctx.storage_manager.finish_read_prefetched(
+                extra_keys, read_locks=read_locks, l1_owners=extra_owners
+            )
 
     @request_handler(HandlerType.BLOCKING)
     def end_session(self, request_id: str) -> None:
