@@ -9,15 +9,26 @@ from unittest.mock import MagicMock, patch
 
 # Third Party
 import pytest
+import torch
 
 # First Party
 from lmcache.lmcache_native import Bitmap
-from lmcache.v1.distributed.api import AttnWindowDesc, PrefetchHandle, PrefetchResult
+from lmcache.v1.distributed.api import (
+    AttnWindowDesc,
+    MemoryLayoutDesc,
+    PrefetchHandle,
+    PrefetchResult,
+    ipc_key_to_object_keys,
+)
+from lmcache.v1.distributed.config import parse_args
+from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.mp_observability.event import EventType
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.modules.lookup import LookupModule, _PrefetchJob
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.multiprocess.rpc import get_rpc_spec
+from lmcache.v1.multiprocess.session import SessionManager
+from lmcache.v1.multiprocess.token_hasher import TokenHasher
 from lmcache.v1.multiprocess.transport.factory import RequestClientFactory
 
 # Test helpers
@@ -535,3 +546,57 @@ def test_disjoint_frees_for_one_lookup_both_land():
     module.free_lookup_locks(_free_locks_key(1024, start=0, end=512), 1)
 
     assert ctx.storage_manager.finish_read_prefetched.call_count == 2
+
+
+def test_end_session_releases_a_lookup_nobody_consumed() -> None:
+    """A request that ends before its lookup status is ever queried (an abort)
+    never learned its hit, so the server releases what the prefetch locked."""
+    chunk = 256
+    layout = MemoryLayoutDesc([torch.Size([4096])], [torch.uint8])
+    storage = StorageManager(
+        parse_args(["--eviction-policy", "noop", "--l1-size-gb", "0.01"])
+    )
+    try:
+        hasher = TokenHasher(chunk_size=chunk)
+        ctx = MagicMock()
+        ctx.chunk_size = chunk
+        ctx.token_hasher = hasher
+        ctx.storage_manager = storage
+        ctx.session_manager = SessionManager(hasher=hasher, ttl=600)
+        ctx.layout_desc_registry.find.return_value = layout
+        ctx.layout_desc_registry.find_attn_desc.return_value = AttnWindowDesc(
+            num_chunks_in_sw=[-1]
+        )
+        ctx.layout_desc_registry.find_group_layout_descs.return_value = {0: layout}
+        module = LookupModule(ctx)
+
+        tokens = list(range(4 * chunk))
+        key = IPCCacheServerKey(
+            model_name="m",
+            world_size=1,
+            num_kv_readers=1,
+            worker_id=None,
+            token_ids=tuple(tokens),
+            start=0,
+            end=len(tokens),
+            request_id="aborted",
+        )
+        cached = ipc_key_to_object_keys(key, hasher.compute_chunk_hashes(tokens), [0])[
+            0
+        ]
+        storage.finish_write_by_owner(
+            storage.prepare_write_completion(storage.reserve_write(cached, layout))
+        )
+
+        module.lookup(key, 1)
+        handle = module._prefetch_jobs["aborted"].handle
+        assert storage.wait_prefetch_status(handle, 5)
+        module.end_session("aborted")
+
+        assert module.report_status() == {"active_prefetch_jobs": 0}
+        assert not any(
+            storage._l1_manager.get_object_state(obj_key).read_lock.is_locked()
+            for obj_key in cached
+        )
+    finally:
+        storage.close()

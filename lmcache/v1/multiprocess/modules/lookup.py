@@ -35,12 +35,15 @@ from lmcache.v1.multiprocess.kv_load_policy import (
     create_kv_load_policy,
 )
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
+from lmcache.v1.multiprocess.session import Session
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
 logger = init_logger(__name__)
 
 # Stateless, so one instance can serve every LookupModule.
 _DEFAULT_LOAD_POLICY = DefaultKVLoadPolicy({})
+# Longer than the read-lock TTL, so a dropped abandoned job holds no lock.
+_ABANDONED_JOB_MAX_AGE_S = 900.0
 
 
 def resolve_prefetched_obj_keys(
@@ -123,6 +126,10 @@ class _PrefetchJob:
     # Names the ``lookup()`` branch that returned before submitting a prefetch
     # task; empty on the normal path.
     early_exit_reason: str = ""
+    # The submitted key rows and per-key read-lock count, so a result nobody
+    # consumes can still be released (see ``_release_abandoned_jobs``).
+    key_rows: tuple[tuple[ObjectKey, ...], ...] = ()
+    num_kv_readers: int = 1
 
 
 class LookupModule(DiscoverableModule):
@@ -161,7 +168,12 @@ class LookupModule(DiscoverableModule):
         self._ctx = ctx
         self._load_policy = load_policy
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
+        # Jobs whose request ended (or re-looked-up) before anyone consumed
+        # the result, with the time they were abandoned. Their read locks are
+        # released once the prefetch finishes.
+        self._abandoned_jobs: list[tuple[float, _PrefetchJob]] = []
         self._prefetch_job_lock = threading.Lock()
+        ctx.session_manager.destroy_listeners.append(self._abandon_prefetch_job)
         self._setup_metrics()
 
     @property
@@ -204,6 +216,9 @@ class LookupModule(DiscoverableModule):
             key: Cache key with request_id embedded.
             tp_size: Legacy wire field; ignored (kept for payload arity).
         """
+        # Abandoned prefetches still running at their request's end are
+        # settled here, on the next lookup.
+        self._release_abandoned_jobs()
         model_name, world_size = key.model_name, key.world_size
         self._ctx.event_bus.publish(
             Event(
@@ -367,6 +382,8 @@ class LookupModule(DiscoverableModule):
             _PrefetchJob(
                 handle=handle,
                 row_windows=tuple(row.sliding_window_size for row in spec.key_groups),
+                key_rows=tuple(tuple(row.keys) for row in spec.key_groups),
+                num_kv_readers=num_kv_readers,
                 request_id=key.request_id,
                 requested_tokens=looked_up_tokens,
                 num_object_groups=attn_desc.num_object_groups,
@@ -625,7 +642,59 @@ class LookupModule(DiscoverableModule):
 
     def _register_prefetch_job(self, job: _PrefetchJob) -> None:
         with self._prefetch_job_lock:
+            replaced = self._prefetch_jobs.get(job.request_id)
             self._prefetch_jobs[job.request_id] = job
+            if replaced is not None:
+                self._abandoned_jobs.append((time.monotonic(), replaced))
+
+    def _abandon_prefetch_job(self, session: Session) -> None:
+        """Session destroy listener: release a lookup nobody consumed.
+
+        A request that ends (END_SESSION or session TTL) before any
+        QUERY/WAIT/FREE consumed its lookup never learned its hit, so no
+        retrieve or FREE will release what the prefetch locked.
+        """
+        with self._prefetch_job_lock:
+            job = self._prefetch_jobs.pop(session.request_id, None)
+            if job is not None:
+                self._abandoned_jobs.append((time.monotonic(), job))
+        self._release_abandoned_jobs()
+
+    def _release_abandoned_jobs(self) -> None:
+        """Release the read locks of abandoned jobs whose prefetch finished.
+
+        Jobs still prefetching are kept for a later call; after
+        ``_ABANDONED_JOB_MAX_AGE_S`` they are dropped, since any locks they
+        could still hold have expired with the read-lock TTL by then.
+        """
+        with self._prefetch_job_lock:
+            if not self._abandoned_jobs:
+                return
+            pending, self._abandoned_jobs = self._abandoned_jobs, []
+        storage = self._ctx.storage_manager
+        now = time.monotonic()
+        still_running: list[tuple[float, _PrefetchJob]] = []
+        for abandoned_at, job in pending:
+            result = storage.query_prefetch_status(job.handle)
+            if result is None:
+                if now - abandoned_at < _ABANDONED_JOB_MAX_AGE_S:
+                    still_running.append((abandoned_at, job))
+                continue
+            # The prefetch keeps a read lock on exactly its hit cells.
+            locked = [
+                row[i]
+                for row, hits in zip(job.key_rows, result.hit_cells, strict=True)
+                for i in hits.get_indices_list()
+            ]
+            if locked:
+                storage.finish_read_prefetched(
+                    locked,
+                    read_locks=job.num_kv_readers,
+                    l1_owners=result.l1_owners if storage.is_multi_l1 else None,
+                )
+        if still_running:
+            with self._prefetch_job_lock:
+                self._abandoned_jobs.extend(still_running)
 
     def _register_empty_prefetch_job(
         self,
