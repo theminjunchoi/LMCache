@@ -15,6 +15,7 @@ import uuid
 import grpc
 
 # First Party
+from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
 from lmcache.v1.multiprocess.futures import MessagingFuture, MessagingStream
 from lmcache.v1.multiprocess.transport.base import RequestClient
 from lmcache.v1.multiprocess.transport.grpc_impl.descriptors import (
@@ -72,8 +73,78 @@ def parse_grpc_target(server_url: str) -> str:
     raise ValueError(f"Unsupported gRPC URL scheme: {parsed.scheme!r}")
 
 
+class GrpcCallFailedError(LMCacheTimeoutError):
+    """A unary gRPC call failed and will never return a result.
+
+    A ZMQ request that fails gets no reply, so callers see a ``TimeoutError``
+    once their wait runs out and treat it as "no result". This keeps that
+    contract for gRPC, where the failure is known right away, and carries the
+    status code for callers that want to tell the cases apart.
+
+    Args:
+        method: Full name of the failed gRPC method.
+        code: The call's gRPC status code.
+        details: The call's status details.
+    """
+
+    def __init__(self, method: str, code: grpc.StatusCode, details: str) -> None:
+        super().__init__(f"{method} failed with {code.name}: {details}")
+        self.method = method
+        self.code = code
+        self.details = details
+
+
+class GrpcStreamDisconnectedError(ConnectionError):
+    """A server-streaming gRPC call ended in a way a new subscription may fix.
+
+    Covers a lost connection and errors the server's handler raised mid-stream,
+    the cases where a ZMQ subscription ends and the subscriber reconnects.
+
+    Args:
+        method: Full name of the gRPC method.
+        code: The call's gRPC status code.
+        details: The call's status details.
+    """
+
+    def __init__(self, method: str, code: grpc.StatusCode, details: str) -> None:
+        super().__init__(f"{method} stream ended with {code.name}: {details}")
+        self.method = method
+        self.code = code
+        self.details = details
+
+
+class GrpcStreamFailedError(RuntimeError):
+    """A server-streaming gRPC call failed in a way retrying won't fix, such
+    as a rejected argument or a method the server doesn't serve.
+
+    Args:
+        method: Full name of the gRPC method.
+        code: The call's gRPC status code.
+        details: The call's status details.
+    """
+
+    def __init__(self, method: str, code: grpc.StatusCode, details: str) -> None:
+        super().__init__(f"{method} stream failed with {code.name}: {details}")
+        self.method = method
+        self.code = code
+        self.details = details
+
+
+# Stream errors a new subscription can recover from; ZMQ ends the
+# subscription in these cases too.
+_STREAM_RECONNECT_CODES = frozenset(
+    {
+        grpc.StatusCode.UNAVAILABLE,
+        grpc.StatusCode.CANCELLED,
+        grpc.StatusCode.INTERNAL,
+        grpc.StatusCode.UNKNOWN,
+    }
+)
+
+
 @dataclass(frozen=True)
 class _ClientRpc:
+    full_name: str
     stub_method: Any
     codec: GrpcMethodCodec
 
@@ -102,6 +173,7 @@ class GrpcMultiprocessClient(RequestClient):
             if name in self._rpc_methods:
                 raise RuntimeError(f"Duplicate gRPC client method: {name}")
             self._rpc_methods[name] = _ClientRpc(
+                full_name=method.full_name,
                 stub_method=getattr(stub, method.name),
                 codec=codec_registry.by_full_name[method.full_name],
             )
@@ -160,12 +232,12 @@ class GrpcMultiprocessClient(RequestClient):
                 try:
                     return rpc.codec.response_decoder(next(call))
                 except grpc.RpcError as exc:
-                    if exc.code() in (
-                        grpc.StatusCode.UNAVAILABLE,
-                        grpc.StatusCode.CANCELLED,
-                    ):
-                        raise ConnectionError("gRPC event stream disconnected") from exc
-                    raise
+                    error_type = (
+                        GrpcStreamDisconnectedError
+                        if exc.code() in _STREAM_RECONNECT_CODES
+                        else GrpcStreamFailedError
+                    )
+                    raise error_type(rpc.full_name, exc.code(), exc.details()) from exc
 
             return MessagingStream(read, call.cancel)
         future: MessagingFuture[Any] = MessagingFuture()
@@ -178,6 +250,10 @@ class GrpcMultiprocessClient(RequestClient):
         def on_done(grpc_future: grpc.Future[Any]) -> None:
             try:
                 result = rpc.codec.response_decoder(grpc_future.result())
+            except grpc.RpcError as exc:
+                future.set_exception(
+                    GrpcCallFailedError(rpc.full_name, exc.code(), exc.details())
+                )
             except BaseException as exc:
                 future.set_exception(exc)
             else:

@@ -67,7 +67,9 @@ from lmcache.v1.multiprocess.transport.grpc_impl.client import (
     CONNECT_TIMEOUT_MS,
     INITIAL_RECONNECT_BACKOFF_MS,
     MAX_RECONNECT_BACKOFF_MS,
+    GrpcCallFailedError,
     GrpcMultiprocessClient,
+    GrpcStreamDisconnectedError,
 )
 from lmcache.v1.multiprocess.transport.grpc_impl.codecs import (
     get_message_codec_registry,
@@ -843,11 +845,83 @@ def test_grpc_normal_worker_limit_and_error_release(max_cpu_workers: int) -> Non
         with pytest.raises(queue.Empty):
             entered.get(timeout=0.1)
         release.set()
-        with pytest.raises(grpc.RpcError, match="handler failed"):
+        with pytest.raises(GrpcCallFailedError, match="handler failed"):
             futures[0].result(5)
         assert all(future.result(5) for future in futures[1:])
         assert client.ping(1).result(5) is True
     finally:
         release.set()
+        client.close()
+        server.close()
+
+
+def test_call_cut_off_by_a_server_stop_fails_as_a_timeout() -> None:
+    """A call in flight when the server goes away fails right away with an
+    error that ``except TimeoutError`` callers catch, as a lost ZMQ reply
+    eventually would."""
+    entered = threading.Event()
+
+    class SlowModule:
+        @request_handler(HandlerType.BLOCKING)
+        def ping(self, instance_id: int | None) -> bool:
+            entered.set()
+            time.sleep(5)
+            return True
+
+    server = GrpcMultiprocessServer(
+        "grpc://127.0.0.1:0",
+        max_cpu_workers=1,
+        max_gpu_workers=1,
+        grpc_server_workers=2,
+    )
+    server.add_modules([SlowModule()])
+    server.start()
+    client = GrpcMultiprocessClient(  # type: ignore[abstract]
+        f"grpc://127.0.0.1:{server.bound_port}"
+    )
+    try:
+        future = client.ping(None)
+        assert entered.wait(5)
+        server.close()
+        with pytest.raises(TimeoutError) as excinfo:
+            future.result(3)
+        assert isinstance(excinfo.value, GrpcCallFailedError)
+        assert excinfo.value.code is grpc.StatusCode.UNAVAILABLE
+    finally:
+        client.close()
+        server.close()
+
+
+@pytest.mark.parametrize("grpc_server_mode", ["sync", "aio"])
+def test_stream_handler_error_ends_the_subscription(grpc_server_mode: str) -> None:
+    """A handler error mid-stream ends the subscription with a ConnectionError,
+    like a ZMQ subscription, so subscribers reconnect instead of giving up."""
+
+    class Module:
+        @request_handler()
+        def subscribe_kv_events(
+            self, instance_id: int, model_name: str, cursor: int, max_events: int
+        ) -> MessagingStream[KVEventBatch]:
+            def read(closed: threading.Event) -> KVEventBatch:
+                raise RuntimeError("stream handler failed")
+
+            return MessagingStream(read, lambda: None)
+
+    config = MPServerConfig(
+        transport="grpc",
+        host="127.0.0.1",
+        port=0,
+        grpc_server_mode=cast(Any, grpc_server_mode),
+    )
+    server = build_grpc_request_server([cast(Any, Module())], config)
+    server.start()
+    client = GrpcMultiprocessClient(f"grpc://127.0.0.1:{server.bound_port}")  # type: ignore[abstract]
+    try:
+        stream = client.subscribe_kv_events(1, "model", 0, 16)
+        with pytest.raises(ConnectionError) as excinfo:
+            next(stream)
+        assert isinstance(excinfo.value, GrpcStreamDisconnectedError)
+        assert excinfo.value.code is grpc.StatusCode.INTERNAL
+    finally:
         client.close()
         server.close()
