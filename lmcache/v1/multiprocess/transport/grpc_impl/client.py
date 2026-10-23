@@ -8,6 +8,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import urlparse
+import itertools
+import os
+import queue
 import threading
 import uuid
 
@@ -17,6 +20,7 @@ import grpc
 # First Party
 from lmcache.v1.multiprocess.futures import MessagingFuture, MessagingStream
 from lmcache.v1.multiprocess.transport.base import RequestClient
+from lmcache.v1.multiprocess.transport.grpc_impl import mux
 from lmcache.v1.multiprocess.transport.grpc_impl.descriptors import (
     client_method_name,
     iter_methods,
@@ -76,6 +80,63 @@ def parse_grpc_target(server_url: str) -> str:
 class _ClientRpc:
     stub_method: Any
     codec: GrpcMethodCodec
+    mux_method: mux.MuxMethod | None = None
+
+
+class _MuxStream:
+    """One bidi stream carrying this client's unary calls as frames."""
+
+    def __init__(self, channel: grpc.Channel, metadata: Any) -> None:
+        self._outbox: queue.SimpleQueue[bytes | None] = queue.SimpleQueue()
+        self._ids = itertools.count()
+        self._waiting: dict[int, tuple[MessagingFuture[Any], _ClientRpc]] = {}
+        self._lock = threading.Lock()
+        call = channel.stream_stream(mux.MUX_METHOD)(
+            iter(self._outbox.get, None), metadata=metadata, wait_for_ready=True
+        )
+        self._call = call
+        threading.Thread(target=self._read, daemon=True, name="grpc-mux-read").start()
+
+    def send(self, rpc: _ClientRpc, request: Any) -> MessagingFuture[Any]:
+        assert rpc.mux_method is not None
+        future: MessagingFuture[Any] = MessagingFuture()
+        call_id = next(self._ids)
+        with self._lock:
+            self._waiting[call_id] = (future, rpc)
+        self._outbox.put(
+            mux.REQUEST_HEADER.pack(call_id, rpc.mux_method.index)
+            + request.SerializeToString()
+        )
+        return future
+
+    def close(self) -> None:
+        self._outbox.put(None)
+        self._call.cancel()
+
+    def _read(self) -> None:
+        try:
+            for frame in self._call:
+                call_id, status = mux.RESPONSE_HEADER.unpack_from(frame)
+                body = frame[mux.RESPONSE_HEADER.size :]
+                with self._lock:
+                    future, rpc = self._waiting.pop(call_id)
+                assert rpc.mux_method is not None
+                if status == mux.STATUS_OK:
+                    try:
+                        future.set_result(
+                            rpc.codec.response_decoder(
+                                rpc.mux_method.response_cls.FromString(body)
+                            )
+                        )
+                    except BaseException as exc:
+                        future.set_exception(exc)
+                else:
+                    future.set_exception(RuntimeError(body.decode()))
+        except grpc.RpcError as exc:
+            with self._lock:
+                waiting, self._waiting = self._waiting, {}
+            for future, _ in waiting.values():
+                future.set_exception(ConnectionError(str(exc)))
 
 
 ClientRpcCallable = Callable[..., MessagingFuture[Any] | MessagingStream[Any]]
@@ -91,6 +152,7 @@ class GrpcMultiprocessClient(RequestClient):
         stubs: dict[str, Any] = {}
         self._rpc_methods: dict[str, _ClientRpc] = {}
         codec_registry = get_method_codec_registry()
+        mux_by_name = {m.full_name: m for m in mux.mux_methods()}
         for binding, method in iter_methods():
             service_name = binding.descriptor.name
             stub = stubs.get(service_name)
@@ -104,8 +166,15 @@ class GrpcMultiprocessClient(RequestClient):
             self._rpc_methods[name] = _ClientRpc(
                 stub_method=getattr(stub, method.name),
                 codec=codec_registry.by_full_name[method.full_name],
+                mux_method=mux_by_name.get(method.full_name),
             )
         self._metadata = ((_CLIENT_ID_METADATA_KEY, uuid.uuid4().bytes),)
+        # Prototype switch: send unary calls as frames on one stream.
+        self._mux = (
+            _MuxStream(self._channel, self._metadata)
+            if os.environ.get("LMCACHE_GRPC_MUX") == "1"
+            else None
+        )
 
     def __getattr__(self, name: str) -> ClientRpcCallable:
         """Resolve a generated RPC as a method-oriented client call."""
@@ -142,6 +211,8 @@ class GrpcMultiprocessClient(RequestClient):
 
     def close(self) -> None:
         """Close the underlying gRPC channel."""
+        if self._mux is not None:
+            self._mux.close()
         self._channel.close()
 
     def _call(
@@ -168,6 +239,8 @@ class GrpcMultiprocessClient(RequestClient):
                     raise
 
             return MessagingStream(read, call.cancel)
+        if self._mux is not None and rpc.mux_method is not None:
+            return self._mux.send(rpc, request)
         future: MessagingFuture[Any] = MessagingFuture()
         call = rpc.stub_method.future(
             request,

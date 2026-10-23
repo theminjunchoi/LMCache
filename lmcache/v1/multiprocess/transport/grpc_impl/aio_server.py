@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 import asyncio
+import functools
 import threading
 
 # Third Party
@@ -15,6 +16,7 @@ import grpc
 from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.futures import MessagingStream
 from lmcache.v1.multiprocess.request_handler import HandlerType
+from lmcache.v1.multiprocess.transport.grpc_impl import mux
 from lmcache.v1.multiprocess.transport.grpc_impl.descriptors import ServiceBinding
 from lmcache.v1.multiprocess.transport.grpc_impl.server_base import (
     GrpcMultiprocessServerBase,
@@ -228,6 +230,81 @@ class GrpcAioMultiprocessServer(GrpcMultiprocessServerBase):
             done.set()
             credits.release()
             stream.close()
+
+    def _register_mux(
+        self, server: Any, handlers: dict[str, GrpcRequestHandler]
+    ) -> None:
+        table = [(m, handlers[m.full_name]) for m in mux.mux_methods()]
+
+        async def pipe(
+            messages: AsyncIterator[bytes], context: grpc.aio.ServicerContext
+        ) -> AsyncIterator[bytes]:
+            loop = asyncio.get_running_loop()
+            out: asyncio.Queue[bytes | None] = asyncio.Queue()
+            affinity_key = client_affinity_key(context)
+            in_flight = [0]
+            ended = [False]
+
+            def reply(frame: bytes) -> None:
+                out.put_nowait(frame)
+                in_flight[0] -= 1
+                if ended[0] and in_flight[0] == 0:
+                    out.put_nowait(None)
+
+            def finish(call_id: int, registered: GrpcRequestHandler, fut: Any) -> None:
+                # Runs on the worker that ran the handler.
+                try:
+                    body = registered.response_encoder(fut.result()).SerializeToString()
+                    frame = mux.RESPONSE_HEADER.pack(call_id, mux.STATUS_OK) + body
+                except Exception as exc:  # noqa: BLE001
+                    frame = (
+                        mux.RESPONSE_HEADER.pack(call_id, mux.STATUS_ERROR)
+                        + repr(exc).encode()
+                    )
+                loop.call_soon_threadsafe(reply, frame)
+
+            def submit(frame: bytes) -> None:
+                call_id, index = mux.REQUEST_HEADER.unpack_from(frame)
+                method, registered = table[index]
+                request = method.request_cls.FromString(
+                    frame[mux.REQUEST_HEADER.size :]
+                )
+                payloads = registered.request_decoder(request)
+                handler = registered.handler
+                # Submitted in arrival order, straight to the pool ZMQ would use.
+                if registered.handler_type is HandlerType.SERIALIZED:
+                    fut = self._serialized_pool.submit(handler, *payloads)
+                elif registered.requires_client_affinity:
+                    fut = self._affinity_pool.submit(
+                        handler, *payloads, affinity_key=affinity_key
+                    )
+                else:
+                    fut = self._normal_pool.submit(handler, *payloads)
+                in_flight[0] += 1
+                fut.add_done_callback(functools.partial(finish, call_id, registered))
+
+            async def read() -> None:
+                async for frame in messages:
+                    submit(frame)
+                ended[0] = True
+                if in_flight[0] == 0:
+                    out.put_nowait(None)
+
+            reader = asyncio.create_task(read())
+            try:
+                while (frame := await out.get()) is not None:
+                    yield frame
+            finally:
+                reader.cancel()
+
+        server.add_generic_rpc_handlers(
+            (
+                grpc.method_handlers_generic_handler(
+                    mux.MUX_SERVICE,
+                    {"Pipe": grpc.stream_stream_rpc_method_handler(pipe)},
+                ),
+            )
+        )
 
     def start(self) -> None:
         """Start accepting gRPC requests."""

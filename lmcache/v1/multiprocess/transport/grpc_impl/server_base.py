@@ -75,13 +75,16 @@ class GrpcMultiprocessServerBase(RequestServer):
         """
         handlers_by_operation = bind_module_handlers(modules)
         server = self._grpc_server()
+        all_handlers: dict[str, GrpcRequestHandler] = {}
         for binding in get_service_bindings().values():
             add_servicer = getattr(
                 binding.grpc_module,
                 f"add_{binding.descriptor.name}Servicer_to_server",
             )
             service_handlers = build_service_handlers(binding, handlers_by_operation)
+            all_handlers.update(service_handlers)
             add_servicer(self._make_servicer(binding, service_handlers), server)
+        self._register_mux(server, all_handlers)
         register_grpc_services(modules, server)
 
     def close(self) -> None:
@@ -98,6 +101,11 @@ class GrpcMultiprocessServerBase(RequestServer):
             raise RuntimeError(
                 f"Failed to bind gRPC multiprocess server: {self._bind_url}"
             )
+
+    def _register_mux(
+        self, server: Any, handlers: dict[str, GrpcRequestHandler]
+    ) -> None:
+        """Serve unary handlers over a multiplexed stream; aio only for now."""
 
     def _release_threads(self, wait: bool) -> None:
         self._affinity_pool.shutdown(wait=wait)
