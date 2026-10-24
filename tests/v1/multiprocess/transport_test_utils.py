@@ -4,6 +4,10 @@
 # Standard
 from typing import Any, Literal
 from urllib.parse import urlsplit
+import importlib.util
+
+# Third Party
+import pytest
 
 # First Party
 from lmcache.v1.multiprocess.config import MPServerConfig
@@ -12,6 +16,12 @@ from lmcache.v1.multiprocess.transport.server_factory import create_request_serv
 
 RequestTransport = Literal["zmq", "grpc"]
 REQUEST_TRANSPORTS: tuple[RequestTransport, ...] = ("zmq", "grpc")
+
+# The native gRPC server needs the Rust front, which is built separately.
+requires_grpc_front = pytest.mark.skipif(
+    importlib.util.find_spec("lmcache_rust_grpc_front") is None,
+    reason="lmcache_rust_grpc_front is not installed",
+)
 
 
 def request_server_url(transport: RequestTransport, port: int) -> str:
