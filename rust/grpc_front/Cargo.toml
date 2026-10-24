@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "lmcache_rust_grpc_front"
+version = "0.0.1"
+edition = "2021"
+# tonic 0.14 needs rustc 1.88.
+rust-version = "1.88"
+
+[lib]
+name = "lmcache_rust_grpc_front"
+crate-type = ["cdylib"]
+
+[features]
+# Disable extension-module for cargo test so test binaries link to libpython.
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+bytes = "1.9"
+crossbeam-channel = "0.5"
+futures-core = "0.3"
+h2 = "0.4"
+http = "1"
+http-body = "1"
+hyper = { version = "1", features = ["client", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+log = "0.4"
+pyo3 = { version = "0.29", features = ["abi3-py310"] }
+pyo3-log = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+tonic = { version = "0.14", default-features = false, features = ["server", "gzip"] }
+
+# The per-call path crosses crates (hyper, h2, tonic); let them inline.
+[profile.release]
+lto = "thin"
+codegen-units = 1
