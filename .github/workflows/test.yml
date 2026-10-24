@@ -33,6 +33,7 @@ jobs:
     outputs:
       lmcache: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'release' || steps.filter.outputs.lmcache == 'true' }}
       raw_block: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'release' || steps.filter.outputs.raw_block == 'true' }}
+      grpc_front: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'release' || steps.filter.outputs.grpc_front == 'true' }}
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         if: github.event_name == 'push'
@@ -58,6 +59,12 @@ jobs:
               - 'tests/v1/storage_backend/test_raw_block*.py'
               - 'tests/v1/storage_backend/raw_block_test_utils.py'
               - 'tests/v1/multiprocess/test_raw_block_l2_adapter.py'
+              - '.github/workflows/test.yml'
+            grpc_front:
+              - 'rust/grpc_front/**'
+              - 'lmcache/v1/multiprocess/**'
+              - 'tests/v1/multiprocess/test_grpc_*.py'
+              - 'tests/v1/multiprocess/test_worker_liveness.py'
               - '.github/workflows/test.yml'
 
   test:
@@ -197,3 +204,63 @@ jobs:
             tests/v1/storage_backend/test_raw_block_device.py \
             tests/v1/storage_backend/test_raw_block_core.py \
             tests/v1/multiprocess/test_raw_block_l2_adapter.py
+
+  grpc-front-tests:
+    needs: changes
+    if: needs.changes.outputs.grpc_front == 'true'
+    name: native gRPC server tests
+    runs-on: ubuntu-latest
+    env:
+      LMCACHE_LOG_LEVEL: CRITICAL
+
+    steps:
+      - name: "Harden Runner"
+        uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            **/pyproject.toml
+            **/requirements/*.txt
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install maturin
+          python -m pip install -r requirements/test.txt
+          python -m pip install -r requirements/common.txt
+          NO_GPU_EXT=1 python -m pip install -e . --no-build-isolation
+
+      - name: Run gRPC front Rust unit tests
+        run: cargo test --locked --manifest-path rust/grpc_front/Cargo.toml --no-default-features
+
+      - name: Build gRPC front Rust extension
+        run: |
+          python -m maturin build --release --locked \
+            --manifest-path rust/grpc_front/Cargo.toml \
+            --out .pytest-tmp/grpc-front-dist
+          python -m pip install .pytest-tmp/grpc-front-dist/*.whl
+
+      # The shared gRPC transport tests run for every server mode; the main
+      # test job already covers sync and aio, so only the native cases here.
+      - name: Run native gRPC server tests
+        run: |
+          pytest -q --basetemp=.pytest-tmp/grpc-front \
+            tests/v1/multiprocess/test_grpc_front.py \
+            tests/v1/multiprocess/test_grpc_native_server.py
+          pytest -q --basetemp=.pytest-tmp/grpc-front -k native \
+            tests/v1/multiprocess/test_grpc_transport.py \
+            tests/v1/multiprocess/test_worker_liveness.py

@@ -1,0 +1,99 @@
+name: Build gRPC Front Rust Artifacts
+
+# Reusable workflow that builds the wheels of the native gRPC server's Rust
+# module (lmcache_rust_grpc_front, rust/grpc_front) for amd64 and arm64. The
+# server imports the module only for --grpc-server-mode native. The module
+# uses only the stable ABI, so one abi3 wheel per architecture covers
+# CPython 3.10 and later. On a release tag the wheels carry the release
+# version, so images can pin lmcache-rust-grpc-front to the same version as
+# lmcache.
+
+on:
+    workflow_call:
+    workflow_dispatch:
+
+env:
+    LC_ALL: en_US.UTF-8
+
+defaults:
+    run:
+        shell: bash
+
+permissions:
+    contents: read
+
+jobs:
+    build-artifacts:
+        name: Build gRPC front wheels (${{ matrix.arch }})
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - arch: amd64
+                      target: x86_64
+                      runner: ubuntu-latest
+                    - arch: arm64
+                      target: aarch64
+                      runner: ubuntu-24.04-arm
+        runs-on: ${{ matrix.runner }}
+        steps:
+            - name: "Harden Runner"
+              uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+              with:
+                disable-sudo-and-containers: false
+                egress-policy: audit
+
+            - name: Checkout code
+              uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+            - name: Stamp the release version from the tag
+              if: startsWith(github.ref, 'refs/tags/v')
+              run: .github/scripts/stamp_grpc_front_version.sh "${GITHUB_REF_NAME#v}"
+
+            - name: Build wheels
+              uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+              with:
+                target: ${{ matrix.target }}
+                manylinux: "2_28"
+                args: >-
+                    --release --locked --out dist
+                    --manifest-path rust/grpc_front/Cargo.toml
+
+            # The oldest Python the abi3 wheel claims to support.
+            - name: Set up Python
+              uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+              with:
+                python-version: "3.10"
+
+            # Serve one call through the wheel: an import alone wouldn't catch a
+            # broken runtime.
+            - name: Test the wheel
+              run: |
+                wheels=(dist/*.whl)
+                printf '%s\n' "${wheels[@]}"
+                test "${#wheels[@]}" -eq 1
+                python -m pip install grpcio dist/*.whl
+                python - <<'EOF'
+                import threading
+                import grpc
+                from lmcache_rust_grpc_front import NativeGrpcFront
+
+                front = NativeGrpcFront("127.0.0.1:0", [("/t.S/Echo", False)])
+                front.start()
+
+                def serve():
+                    for _, call_id, _, payload, _ in front.recv_batch(1, 5000) or []:
+                        front.respond(call_id, payload[::-1])
+
+                threading.Thread(target=serve).start()
+                with grpc.insecure_channel(f"127.0.0.1:{front.bound_port}") as channel:
+                    assert channel.unary_unary("/t.S/Echo")(b"abc", timeout=5) == b"cba"
+                front.close()
+                print("echo OK")
+                EOF
+
+            - name: Upload release artifacts to GHA
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                name: release-grpc-front-artifacts-${{ matrix.arch }}
+                path: dist/*.whl

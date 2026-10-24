@@ -58,6 +58,7 @@ jobs:
                         - 'pyproject_cli.toml'
                         - 'requirements/**.txt'
                         - 'rust/raw_block/**'
+                        - 'rust/grpc_front/**'
                         - 'docker/**'
                         - '.github/workflows/test.yml'
                         - '.github/workflows/code_quality_checks.yml'
@@ -66,6 +67,8 @@ jobs:
                         - '.github/workflows/build_cli_artifacts.yml'
                         - '.github/workflows/build_raw_block_artifacts.yml'
                         - '.github/scripts/stamp_raw_block_version.sh'
+                        - '.github/workflows/build_grpc_front_artifacts.yml'
+                        - '.github/scripts/stamp_grpc_front_version.sh'
                         - '.github/workflows/build_cu129_artifacts.yml'
                         - '.github/workflows/build_rocm_artifacts.yml'
                         - '.github/workflows/build_xpu_artifacts.yml'
@@ -103,6 +106,14 @@ jobs:
         if: needs.changes.outputs.lmcache == 'true'
         name: Build raw-block Rust module
         uses: ./.github/workflows/build_raw_block_artifacts.yml
+
+    # The native gRPC server's Rust module (lmcache_rust_grpc_front), published
+    # the same way.
+    build-grpc-front:
+        needs: changes
+        if: needs.changes.outputs.lmcache == 'true'
+        name: Build gRPC front Rust module
+        uses: ./.github/workflows/build_grpc_front_artifacts.yml
 
     build-cu129:
         needs: changes
@@ -388,6 +399,47 @@ jobs:
                   gh release upload '${{ github.ref_name }}' dist/* --repo '${{ github.repository }}'
 
             - name: Upload lmcache-rust-raw-block-io to PyPI
+              uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+              with:
+                verbose: true
+
+    # The gRPC front Rust module, uploaded on its own like raw-block. The
+    # release images do not wait for it: they do not include it yet.
+    publish-grpc-front-pypi:
+        name: Publish lmcache-rust-grpc-front release to pypi.org
+        if: |
+            needs.build-grpc-front.result == 'success' &&
+            needs.test.result == 'success' &&
+            needs.code-quality.result == 'success' &&
+            needs.changes.outputs.lmcache == 'true' &&
+            github.repository_owner == 'LMCache' && github.event.action == 'published'
+        permissions:
+            id-token: write
+            contents: write
+        runs-on: ubuntu-latest
+        needs: [changes, build-grpc-front, test, code-quality]
+
+        steps:
+            - name: Harden Runner
+              uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+              with:
+                  disable-sudo-and-containers: false
+                  egress-policy: audit
+
+            - name: Fetch gRPC front release artifacts
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+              with:
+                  pattern: release-grpc-front-artifacts-*
+                  merge-multiple: true
+                  path: dist
+
+            - name: Upload gRPC front release artifacts to GitHub release
+              env:
+                  GITHUB_TOKEN: ${{ github.token }}
+              run: >-
+                  gh release upload '${{ github.ref_name }}' dist/* --repo '${{ github.repository }}'
+
+            - name: Upload lmcache-rust-grpc-front to PyPI
               uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
               with:
                 verbose: true

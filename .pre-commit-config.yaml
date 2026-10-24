@@ -112,3 +112,16 @@ repos:
     language: system
     types: [text]
     files: ^rust/raw_block/.*\.rs$
+  # Same ids as the raw_block hooks, so SKIP=rust-fmt,rust-clippy covers both.
+  - id: rust-fmt
+    name: Rust Format Check (grpc_front)
+    entry: bash -c 'cd rust/grpc_front && cargo fmt --check'
+    language: system
+    types: [text]
+    files: ^rust/grpc_front/.*\.rs$
+  - id: rust-clippy
+    name: Rust Clippy Check (grpc_front)
+    entry: bash -c 'cd rust/grpc_front && cargo clippy -- -D warnings'
+    language: system
+    types: [text]
+    files: ^rust/grpc_front/.*\.rs$
