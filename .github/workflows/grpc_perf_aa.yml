@@ -1,0 +1,61 @@
+name: gRPC performance A/A
+
+on:
+  push:
+    branches: [perf-aa]
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  aa:
+    name: A/A ${{ matrix.run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2, 3, 4, 5, 6, 7, 8]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            **/pyproject.toml
+            **/requirements/*.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements/test.txt
+          python -m pip install -r requirements/common.txt
+          python -m pip install -r requirements/grpc_native.txt
+
+      - name: Install the base and head builds
+        run: |
+          git worktree add ../base HEAD
+          for build in base head; do
+            src=$([ "$build" = base ] && echo ../base || echo .)
+            python -m venv --system-site-packages "../venv-$build"
+            NO_GPU_EXT=1 "../venv-$build/bin/pip" install -q --no-deps \
+              --no-build-isolation -e "$src"
+          done
+
+      - name: Compare
+        run: |
+          nproc; lscpu | grep 'Model name'
+          python .github/scripts/grpc_perf_check.py compare \
+            --base-python ../venv-base/bin/python \
+            --head-python ../venv-head/bin/python
