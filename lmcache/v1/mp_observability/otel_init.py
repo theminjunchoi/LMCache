@@ -49,7 +49,7 @@ _GRPC_LATENCY_BOUNDS = (
 # default and holds the GIL for the whole batch. Under load that stalls requests
 # for several ms, so flush smaller batches more often.
 _GRPC_EXPORT_INTERVAL_ENV = "GRPC_PYTHON_CENSUS_EXPORT_BATCH_INTERVAL_SECS"
-_GRPC_EXPORT_INTERVAL_SECS = "0.05"
+_GRPC_EXPORT_INTERVAL_SECS = "0.5"
 
 
 def _build_resource(resource_attributes: dict[str, str] | None) -> "Resource":
